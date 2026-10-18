@@ -124,8 +124,11 @@ fun SpatialShell(graph: AppGraph, diagnostics: @Composable () -> Unit) {
                         modifier = Modifier.fillMaxSize(),
                     )
                     // TEMP-DEBUG (test only, remove before the demo): marker test button.
-                    Box(modifier = Modifier.align(Alignment.TopStart).padding(PANEL_MARGIN)) {
-                        androidx.compose.material3.Button(onClick = {
+                    Box(modifier = Modifier.align(Alignment.CenterEnd).padding(PANEL_MARGIN)) {
+                        androidx.compose.material3.Button(
+                            modifier = Modifier.padding(8.dp),
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 48.dp, vertical = 32.dp),
+                            onClick = {
                             debugScope.launch {
                                 debugStatus = graph.perception?.debugPlaceAnchorAhead() ?: "no XR session"
                                 graph.perception?.debugLastAnchor?.let { id ->
@@ -133,7 +136,12 @@ fun SpatialShell(graph: AppGraph, diagnostics: @Composable () -> Unit) {
                                     graph.navigationEngine.guideTo(id)
                                 }
                             }
-                        }) { androidx.compose.material3.Text(debugLive ?: debugStatus) }
+                        }) {
+                            androidx.compose.material3.Text(
+                                debugLive ?: debugStatus,
+                                fontSize = androidx.compose.ui.unit.TextUnit(36f, androidx.compose.ui.unit.TextUnitType.Sp),
+                            )
+                        }
                     }
                     Box(modifier = Modifier.align(Alignment.BottomStart).padding(PANEL_MARGIN)) {
                         androidx.compose.foundation.layout.Column {

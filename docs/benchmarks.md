@@ -20,7 +20,7 @@ VLM median/p90 = wall time of `InferenceEngine.describe(still, READ, 60)` from t
 | Text Reader capture → first spoken word | ≤ 6 s | not measured | | |
 | Audio Description capture → first spoken word | ≤ 8 s | not measured | | |
 | Detector throughput during Navigation | ≥ 5 fps | not measured | | |
-| Proximity warning after threshold crossed | ≤ 300 ms | not measured | | |
+| Proximity warning after threshold crossed | ≤ 300 ms | 16–40 ms depth copy → cue emitted (≈30 cues, 3 runs); earcon/speech not included | pass for the R3 part (development runs, Wi-Fi on, not airplane mode) | `vysion.latency: proximity cue … after the depth sample`, Galaxy XR SM-I610, 2026-10-17 |
 | App resident memory with VLM loaded | ≤ 4 GB | not measured | | |
 | 10 min continuous Navigation, detector ≥ 3 fps | pass | not measured | | |
 | "stop" interrupts speech | ≤ 300 ms | not measured | | |

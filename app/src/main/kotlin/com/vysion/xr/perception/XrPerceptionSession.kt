@@ -10,6 +10,10 @@ import androidx.xr.arcore.Anchor
 import androidx.xr.arcore.AnchorCreateSuccess
 import androidx.xr.arcore.ArDevice
 import androidx.xr.arcore.Depth
+import androidx.xr.arcore.Hand
+import androidx.xr.arcore.HandJointType
+import androidx.xr.arcore.Plane
+import androidx.xr.arcore.PlaneLabel
 import androidx.xr.arcore.RenderViewpoint
 import androidx.xr.arcore.TrackingState
 import androidx.xr.runtime.AnchorPersistenceMode
@@ -50,6 +54,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -424,29 +430,14 @@ class XrPerceptionSession(
     override val depthFrames: Flow<DepthFrame> = _depthFrames.asSharedFlow()
 
     /**
-     * FR-N5 plane stream.
-     *
-     * Feeder to implement (stack.md R3 "Planes"):
-     * ```
-     * Plane.subscribe(session).collect { set ->
-     *     _planes.value = set.map { p ->
-     *         val s = p.state.value
-     *         PlaneObservation(id = p.hashCode().toString(), kind = s.label.toPlaneKind(),
-     *             tracking = s.trackingState.toTracking(),
-     *             center = s.centerPose.translation.v3(), normal = s.centerPose.up.v3(),
-     *             axisX = s.centerPose.right.v3(), axisZ = (s.centerPose.forward * -1f).v3(),
-     *             polygon = s.vertices.map { Vec2(it.x, it.y) }, timestampNanos = SystemClock.elapsedRealtimeNanos())
-     *     }
-     * }
-     * ```
+     * FR-N5 plane stream: `Plane.subscribe(session)` sampled every [PLANE_SAMPLE_MS]; subsumed planes
+     * are dropped. `center`/`normal` from the center pose (normal = local +Y), polygon in local X/Z.
      */
     override val planes: StateFlow<List<PlaneObservation>> = _planes.asStateFlow()
 
     /**
-     * Hand stream (R1 consumes pinch through its own `HandSource` later; R3's FR-D4 pointing is P2).
-     *
-     * Feeder to implement (stack.md R3 "Hands"): `Hand.left(session).state` and `Hand.right(session).state`,
-     * joints transformed with `session.scene.perceptionSpace.transformPoseTo(pose, session.scene.activitySpace)`.
+     * Hand stream from `Hand.left/right(session).state`: thumb tip, index tip and index proximal joints
+     * (R1's pinch, R3's FR-D4 pointing). Assumed to share [headPose]'s perception space (UNVERIFIED).
      */
     override val hands: Flow<HandObservation> = _hands.asSharedFlow()
 
@@ -611,6 +602,9 @@ class XrPerceptionSession(
                     feeders = scope.launch {
                         launchDepthFeed(xrSession)
                         launchHeadPoseFeed(xrSession)
+                        launchPlaneFeed(xrSession)
+                        // Hand feed (launchHandFeed) stays off until a consumer exists (FR-D4 pointing needs the VLM):
+                        // two hands at the frame rate is load with no reader.
                     }
                     _state.value = SessionState.RUNNING
                     Log.i(TAG, "XR session configured successfully; state=${_state.value}")
@@ -642,8 +636,13 @@ class XrPerceptionSession(
             val depth = if (stereo) Depth.left(xrSession) else Depth.mono(xrSession)
             val view = if (stereo) RenderViewpoint.left(xrSession) else RenderViewpoint.mono(xrSession)
 
+            var lastCopyNanos = 0L
             depth.state.collect { state ->
                 val map = state.smoothDepthMap ?: return@collect
+                // Consumers sample at 10 Hz; copying every runtime frame only makes garbage.
+                val nowNanos = SystemClock.elapsedRealtimeNanos()
+                if (nowNanos - lastCopyNanos < DEPTH_COPY_PERIOD_NANOS) return@collect
+                lastCopyNanos = nowNanos
                 val fov = view.state.value.fieldOfView
                 val fovDeg = FovDeg(
                     horizontal = Math.toDegrees((fov.angleRight - fov.angleLeft).toDouble()).toFloat(),
@@ -713,6 +712,76 @@ class XrPerceptionSession(
         } catch (e: Exception) {
             Log.e(TAG, "XR head pose feed stopped; guidance and plane cues are unavailable", e)
         }
+    }
+
+    private fun CoroutineScope.launchPlaneFeed(xrSession: Session): Job = launch {
+        try {
+            val known = Plane.subscribe(xrSession)
+            var loggedFirst = false
+            // The set only emits when planes appear or go; poses and polygons change in place, so sample.
+            while (isActive) {
+                val now = SystemClock.elapsedRealtimeNanos()
+                _planes.value = known.value.mapNotNull { plane ->
+                    val st = plane.state.value
+                    if (st.subsumedBy != null) return@mapNotNull null
+                    val pose = st.centerPose
+                    PlaneObservation(
+                        id = plane.hashCode().toString(),
+                        kind = st.label.toPlaneKind(),
+                        tracking = st.trackingState.toTracking(),
+                        center = pose.translation.toVec3(),
+                        normal = pose.up.toVec3(),
+                        axisX = pose.right.toVec3(),
+                        axisZ = pose.backward.toVec3(),
+                        polygon = st.vertices.map { Vec2(it.x, it.y) },
+                        timestampNanos = now,
+                    )
+                }
+                if (!loggedFirst && _planes.value.isNotEmpty()) {
+                    Log.i(TAG, "planes tracked: ${_planes.value.groupingBy { it.kind }.eachCount()} (FR-N5)")
+                    loggedFirst = true
+                }
+                delay(PLANE_SAMPLE_MS)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "XR plane feed stopped; wall and floor cues are unavailable", e)
+        }
+    }
+
+    private fun CoroutineScope.launchHandFeed(xrSession: Session): Job = launch {
+        for ((side, hand) in listOf(HandSide.LEFT to Hand.left(xrSession), HandSide.RIGHT to Hand.right(xrSession))) {
+            launch {
+                try {
+                    hand.state.collect { st ->
+                        val joints = st.handJoints
+                        _hands.tryEmit(
+                            HandObservation(
+                                side = side,
+                                tracking = st.trackingState.toTracking(),
+                                thumbTip = joints[HandJointType.THUMB_TIP]?.translation?.toVec3(),
+                                indexTip = joints[HandJointType.INDEX_TIP]?.translation?.toVec3(),
+                                indexProximal = joints[HandJointType.INDEX_PROXIMAL]?.translation?.toVec3(),
+                                timestampNanos = SystemClock.elapsedRealtimeNanos(),
+                            ),
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "XR $side hand feed stopped", e)
+                }
+            }
+        }
+    }
+
+    private fun PlaneLabel.toPlaneKind(): PlaneKind = when (this) {
+        PlaneLabel.WALL -> PlaneKind.WALL
+        PlaneLabel.FLOOR -> PlaneKind.FLOOR
+        PlaneLabel.CEILING -> PlaneKind.CEILING
+        PlaneLabel.TABLE -> PlaneKind.TABLE
+        else -> PlaneKind.UNKNOWN
     }
 
     private fun Vector3.toVec3() = Vec3(x, y, z)
@@ -946,5 +1015,11 @@ class XrPerceptionSession(
 
         /** How long [start] waits for Compose for XR to publish its Session before creating one. */
         private const val COMPOSE_SESSION_WAIT_MS = 5_000L
+
+        /** Plane snapshot cadence; [XrNavigationEngine] evaluates planes every 500 ms. */
+        private const val PLANE_SAMPLE_MS = 250L
+
+        /** Depth maps are copied at most this often (~12 Hz), just above the 10 Hz proximity loop. */
+        private const val DEPTH_COPY_PERIOD_NANOS = 80_000_000L
     }
 }
