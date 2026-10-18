@@ -91,6 +91,9 @@ fun SpatialShell(graph: AppGraph, diagnostics: @Composable () -> Unit) {
     val debugLiveFlow: kotlinx.coroutines.flow.StateFlow<String?> =
         androidx.compose.runtime.remember { graph.perception?.debugLive ?: kotlinx.coroutines.flow.MutableStateFlow(null) }
     val debugLive by debugLiveFlow.collectAsState()
+    val debugPingFlow: kotlinx.coroutines.flow.StateFlow<String> =
+        androidx.compose.runtime.remember { graph.perception?.debugPing ?: kotlinx.coroutines.flow.MutableStateFlow("ping: no XR") }
+    val debugPing by debugPingFlow.collectAsState()
     var debugCue by androidx.compose.runtime.remember { mutableStateOf("no guidance cue yet") }
     LaunchedEffect(Unit) {
         graph.navigationEngine.cues.collect { cue ->
@@ -133,7 +136,10 @@ fun SpatialShell(graph: AppGraph, diagnostics: @Composable () -> Unit) {
                         }) { androidx.compose.material3.Text(debugLive ?: debugStatus) }
                     }
                     Box(modifier = Modifier.align(Alignment.BottomStart).padding(PANEL_MARGIN)) {
-                        androidx.compose.material3.Text(debugCue, color = Color.Yellow)
+                        androidx.compose.foundation.layout.Column {
+                            androidx.compose.material3.Text(debugCue, color = Color.Yellow)
+                            androidx.compose.material3.Text(debugPing, color = Color.Cyan)
+                        }
                     }
                     if (diagnosticsShown) {
                         Box(modifier = Modifier.align(Alignment.TopEnd).padding(PANEL_MARGIN)) {

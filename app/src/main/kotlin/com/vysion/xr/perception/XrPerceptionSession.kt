@@ -2,6 +2,7 @@ package com.vysion.xr.perception
 
 import android.app.Activity
 import android.app.Application
+import android.content.res.AssetManager
 import android.media.SoundPool
 import android.os.SystemClock
 import android.util.Log
@@ -22,9 +23,15 @@ import androidx.xr.runtime.Session
 import androidx.xr.runtime.SessionConfigureSuccess
 import androidx.xr.runtime.SessionCreateSuccess
 import androidx.xr.runtime.XrDevice
+import androidx.xr.runtime.math.FloatSize2d
 import androidx.xr.runtime.math.Pose
 import androidx.xr.runtime.math.Vector3
+import androidx.xr.scenecore.AnchorSpace
+import androidx.xr.scenecore.Entity
+import androidx.xr.scenecore.PanelEntity
+import androidx.xr.scenecore.PointSourceParams
 import androidx.xr.scenecore.SpatialCapability
+import androidx.xr.scenecore.SpatialSoundPool
 import androidx.xr.scenecore.scene
 import com.vysion.xr.core.AnchorId
 import kotlinx.coroutines.CancellationException
@@ -720,12 +727,14 @@ class XrPerceptionSession(
     private var debugAnchorJob: Job? = null
     val debugLive = MutableStateFlow<String?>(null)
     var debugLastAnchor: AnchorId? = null
+    val debugPing = MutableStateFlow("ping: not attached")
 
     suspend fun debugPlaceAnchorAhead(): String {
         val head = _headPose.value ?: return "no head pose yet"
         val point = sampleDepthAlongBearing(head.yawDeg, head.pitchDeg) ?: return "no trusted depth ahead"
         val id = createAnchor(point) ?: return "anchor refused"
         debugLastAnchor = id
+        debugShowMarker(id)
         val start = sqrt(
             (point.x - head.position.x).let { it * it } + (point.y - head.position.y).let { it * it } +
                 (point.z - head.position.z).let { it * it },
@@ -748,6 +757,31 @@ class XrPerceptionSession(
         }
         Log.i(TAG, "DEBUG anchor ${id.value} placed %.2f m ahead".format(start))
         return "marker placed %.2f m ahead".format(start)
+    }
+
+    // TEMP-DEBUG (test only, remove before the demo): a visible red label at the anchor.
+    private var debugMarker: Pair<AnchorSpace, PanelEntity>? = null
+
+    private fun debugShowMarker(id: AnchorId) {
+        val xrSession = session ?: return
+        val anchor = nativeAnchors[id] ?: return
+        debugMarker?.let { (space, panel) -> panel.dispose(); space.dispose() }
+        debugMarker = try {
+            val label = android.widget.TextView(app).apply {
+                text = "MARKER"
+                textSize = 48f
+                setTextColor(android.graphics.Color.WHITE)
+                setBackgroundColor(android.graphics.Color.RED)
+                gravity = android.view.Gravity.CENTER
+            }
+            val space = AnchorSpace.create(xrSession, anchor)
+            val panel = PanelEntity.create(xrSession, label, FloatSize2d(0.3f, 0.15f), "debugMarker", Pose(), space)
+            space to panel
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "DEBUG marker label failed", e)
+            null
+        }
+        Log.i(TAG, "DEBUG marker label shown=${debugMarker != null}")
     }
 
     /**
@@ -856,47 +890,55 @@ class XrPerceptionSession(
 
     // ── SceneCore spatial audio hook for SpatialAudioPinger (A-6; stack.md R3 "Spatial audio", "Entities") ──
 
+    /** Anchor spaces parenting the ping entities, by anchor; disposed with the entity. */
+    private val anchorSpaces = HashMap<AnchorId, AnchorSpace>()
+
+    /** For [SpatialAudioPinger]'s `SoundPool.load(assets.openFd(...))`; package-internal (ADR-0005). */
+    internal val assets: AssetManager get() = app.assets
+
     /**
-     * Real implementation (VERIFIED names):
-     * ```
-     * val anchor = nativeAnchors[id] ?: return null
-     * val space = AnchorSpace.create(session, anchor)                       // scenecore rc02
-     * val entity = Entity.create(session, name)                              // 1-4 arg overloads exist
-     * space.addChild(entity)
-     * return AnchorEntity(id, entity)
-     * ```
+     * An entity parented under `AnchorSpace.create(session, anchor)` so a sound played from it comes
+     * from the anchor. `null` without a session or a known native anchor.
      */
     internal fun createAnchorEntity(id: AnchorId, name: String): AnchorEntity? {
-        Log.w(
-            TAG,
-            "TODO(FR-N3) XrPerceptionSession.createAnchorEntity: AnchorSpace.create(session, anchor) + " +
-                "Entity.create(session, \"$name\") + addChild",
-        )
-        return null
+        val xrSession = session ?: return null
+        val anchor = nativeAnchors[id] ?: return null
+        return try {
+            val space = AnchorSpace.create(xrSession, anchor)
+            val entity = Entity.create(xrSession, name)
+            space.addChild(entity)
+            anchorSpaces[id] = space
+            AnchorEntity(id, entity)
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "anchor entity for ${id.value} not created", e)
+            null
+        }
     }
 
-    /** `(entity.native as Entity).dispose()`; the `AnchorSpace` is disposed with the anchor. */
     internal fun disposeAnchorEntity(entity: AnchorEntity) {
-        Log.w(TAG, "TODO(FR-N3) XrPerceptionSession.disposeAnchorEntity: entity.dispose()")
+        (entity.native as? Entity)?.dispose()
+        anchorSpaces.remove(entity.anchorId)?.dispose()
     }
 
     /**
-     * Real implementation (VERIFIED signature; defaults are not recoverable from bytecode, pass all four):
-     * ```
-     * if (!session.scene.spatialCapabilities.contains(SpatialCapability.SPATIAL_AUDIO)) return -1   // A-6 fallback
-     * return SpatialSoundPool.play(session = session, soundPool = soundPool, soundID = soundId,
-     *     params = PointSourceParams(), entity = entity.native as Entity,
-     *     volume = 1f, priority = 0, loop = 0, rate = 1f)
-     * ```
-     * Returns the SoundPool stream id, or -1 when spatial audio is unavailable.
+     * `SpatialSoundPool.play` from the entity (all four trailing arguments passed: their defaults are
+     * not recoverable from bytecode). Returns the stream id, or -1 when spatial audio is unavailable.
      */
     internal fun playPointSource(entity: AnchorEntity, soundPool: SoundPool, soundId: Int): Int {
-        Log.w(
-            TAG,
-            "TODO(FR-N3) XrPerceptionSession.playPointSource: SpatialSoundPool.play(session, soundPool, soundID, " +
-                "PointSourceParams(), entity, 1f, 0, 0, 1f)",
+        val xrSession = session ?: return -1
+        val native = entity.native as? Entity ?: return -1
+        if (!xrSession.scene.spatialCapabilities.contains(SpatialCapability.SPATIAL_AUDIO)) return -1 // A-6 fallback
+        return SpatialSoundPool.play(
+            session = xrSession,
+            soundPool = soundPool,
+            soundID = soundId,
+            params = PointSourceParams(),
+            entity = native,
+            volume = 1f,
+            priority = 0,
+            loop = 0,
+            rate = 1f,
         )
-        return -1
     }
 
     companion object {
